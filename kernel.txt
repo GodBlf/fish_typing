@@ -1,0 +1,432 @@
+// main.go
+package main
+
+import (
+	"fmt"
+	"log"
+	"net/http"
+	"time"
+
+	"my-go-app/config"
+	"my-go-app/database"
+	"my-go-app/handlers"
+	"my-go-app/middleware"
+	"my-go-app/repository"
+	"my-go-app/router"
+
+	// Import SQLite driver for its side effects (database/sql doesn't include drivers)
+	_ "github.com/mattn/go-sqlite3"
+)
+
+func main() {
+	// Load application configuration
+	cfg := config.LoadConfig()
+	log.Printf("Configuration loaded: Port=%s, DatabaseURL=%s", cfg.Port, cfg.DatabaseURL)
+
+	// Initialize Database connection
+	database.InitDB(cfg.DatabaseURL)
+	defer func() {
+		if err := database.GetDB().Close(); err != nil {
+			log.Printf("Error closing database: %v", err)
+		} else {
+			log.Println("Database connection closed.")
+		}
+	}()
+
+	// Initialize Repositories
+	// These handle direct database interactions for specific models
+	productRepo := repository.NewProductRepository(database.GetDB())
+	userRepo := repository.NewUserRepository(database.GetDB())
+	orderRepo := repository.NewOrderRepository(database.GetDB())
+
+	// Initialize Handlers
+	// These contain the business logic and handle HTTP requests
+	productHandler := handlers.NewProductHandler(productRepo)
+	userHandler := handlers.NewUserHandler(userRepo)
+	orderHandler := handlers.NewOrderHandler(orderRepo)
+	healthHandler := handlers.NewHealthHandler()
+
+	// Initialize Router
+	// This sets up all the API routes and applies global middleware
+	r := router.NewRouter(productHandler, userHandler, orderHandler, healthHandler)
+
+	// Set up the HTTP server
+	server := &http.Server{
+		Addr:         cfg.Port,
+		Handler:      r,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+
+	log.Printf("Server starting on port %s", cfg.Port)
+	// Start the server
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("Server failed to start: %v", err)
+	}
+}
+// config/config.go
+package config
+
+import (
+	"log"
+	"os"
+)
+
+// Config holds all application-wide configuration settings.
+type Config struct {
+	Port        string
+	DatabaseURL string
+	// Add more configuration fields as needed, e.g., JWT_SECRET, API_KEY_HEADER
+	APIKey string
+}
+
+// LoadConfig initializes and returns the application configuration.
+// It prioritizes environment variables over hardcoded defaults.
+func LoadConfig() *Config {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = ":8080" // Default port
+	}
+
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		// Using in-memory SQLite for easy demonstration.
+		// For persistent storage, change this to a file path or a real DB connection string.
+		dbURL = "file::memory:?cache=shared" // In-memory SQLite
+		log.Println("DATABASE_URL not set, using in-memory SQLite.")
+	}
+
+	apiKey := os.Getenv("API_KEY")
+	if apiKey == "" {
+		apiKey = "super-secret-api-key-123" // Default API key for demonstration
+		log.Println("API_KEY not set, using default.")
+	}
+
+	return &Config{
+		Port:        port,
+		DatabaseURL: dbURL,
+		APIKey:      apiKey,
+	}
+}
+
+// database/database.go
+package database
+
+import (
+	"database/sql"
+	"log"
+	"time"
+)
+
+// db is the global database connection pool.
+var db *sql.DB
+
+// InitDB initializes the database connection and creates necessary tables.
+func InitDB(dataSourceName string) {
+	var err error
+	// Open the database connection
+	db, err = sql.Open("sqlite3", dataSourceName)
+	if err != nil {
+		log.Fatalf("Error opening database connection: %v", err)
+	}
+
+	// Set connection pool properties
+	db.SetMaxOpenConns(25)                 // Max number of open connections
+	db.SetMaxIdleConns(10)                 // Max number of idle connections
+	db.SetConnMaxLifetime(5 * time.Minute) // Max lifetime of a connection
+
+	// Ping the database to verify the connection is established
+	if err = db.Ping(); err != nil {
+		log.Fatalf("Error connecting to database: %v", err)
+	}
+
+	log.Println("Database connection established.")
+
+	// Create tables if they don't exist
+	if err := createTables(); err != nil {
+		log.Fatalf("Error creating database tables: %v", err)
+	}
+	log.Println("Database tables ensured.")
+}
+
+// GetDB returns the global database connection.
+func GetDB() *sql.DB {
+	if db == nil {
+		log.Fatal("Database not initialized. Call InitDB first.")
+	}
+	return db
+}
+
+// createTables creates all necessary tables for the application.
+func createTables() error {
+	// Users table
+	usersTableSQL := `
+	CREATE TABLE IF NOT EXISTS users (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		username TEXT UNIQUE NOT NULL,
+		email TEXT UNIQUE NOT NULL,
+		password_hash TEXT NOT NULL,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);`
+	if _, err := db.Exec(usersTableSQL); err != nil {
+		return fmt.Errorf("failed to create users table: %w", err)
+	}
+
+	// Products table
+	productsTableSQL := `
+	CREATE TABLE IF NOT EXISTS products (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT NOT NULL,
+		description TEXT,
+		price REAL NOT NULL,
+		sku TEXT UNIQUE NOT NULL,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);`
+	if _, err := db.Exec(productsTableSQL); err != nil {
+		return fmt.Errorf("failed to create products table: %w", err)
+	}
+
+	// Orders table
+	ordersTableSQL := `
+	CREATE TABLE IF NOT EXISTS orders (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		user_id INTEGER NOT NULL,
+		order_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+		total_amount REAL NOT NULL,
+		status TEXT NOT NULL,
+		FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+	);`
+	if _, err := db.Exec(ordersTableSQL); err != nil {
+		return fmt.Errorf("failed to create orders table: %w", err)
+	}
+
+	// Order Items table (for many-to-many relationship between orders and products)
+	orderItemsTableSQL := `
+	CREATE TABLE IF NOT EXISTS order_items (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		order_id INTEGER NOT NULL,
+		product_id INTEGER NOT NULL,
+		quantity INTEGER NOT NULL,
+		price_at_purchase REAL NOT NULL,
+		FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE,
+		FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE,
+		UNIQUE(order_id, product_id)
+	);`
+	if _, err := db.Exec(orderItemsTableSQL); err != nil {
+		return fmt.Errorf("failed to create order_items table: %w", err)
+	}
+
+	return nil
+}
+
+// models/product.go
+package models
+
+import "time"
+
+// Product represents an item available for sale in the catalog.
+type Product struct {
+	ID          int       `json:"id"`
+	Name        string    `json:"name"`
+	Description string    `json:"description,omitempty"` // omitempty means it won't be serialized if empty
+	Price       float64   `json:"price"`
+	SKU         string    `json:"sku"` // Stock Keeping Unit, unique identifier
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+// models/user.go
+package models
+
+import "time"
+
+// User represents a user account in the system.
+type User struct {
+	ID           int       `json:"id"`
+	Username     string    `json:"username"`
+	Email        string    `json:"email"`
+	PasswordHash string    `json:"-"` // Omit from JSON output for security
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+// UserCreateRequest is used for creating a new user.
+type UserCreateRequest struct {
+	Username string `json:"username"`
+	Email    string `json:"email"`
+	Password string `json:"password"` // Transmitted in plaintext, hashed before storage
+}
+
+// UserLoginRequest is used for user authentication.
+type UserLoginRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+// models/order.go
+package models
+
+import "time"
+
+// OrderStatus defines the possible states of an order.
+type OrderStatus string
+
+const (
+	OrderStatusPending    OrderStatus = "pending"
+	OrderStatusProcessing OrderStatus = "processing"
+	OrderStatusShipped    OrderStatus = "shipped"
+	OrderStatusDelivered  OrderStatus = "delivered"
+	OrderStatusCancelled  OrderStatus = "cancelled"
+)
+
+// Order represents a customer's purchase.
+type Order struct {
+	ID         int         `json:"id"`
+	UserID     int         `json:"user_id"`
+	OrderDate  time.Time   `json:"order_date"`
+	Total      float64     `json:"total_amount"`
+	Status     OrderStatus `json:"status"`
+	OrderItems []OrderItem `json:"order_items,omitempty"` // Nested items
+}
+
+// OrderItem represents a single product within an order.
+type OrderItem struct {
+	ID            int     `json:"id"`
+	OrderID       int     `json:"order_id"`
+	ProductID     int     `json:"product_id"`
+	Quantity      int     `json:"quantity"`
+	PriceAtPurchase float64 `json:"price_at_purchase"` // Price at the time of order
+	// You might want to embed the product details here or fetch them separately
+	ProductName string `json:"product_name,omitempty"` // For convenience in API response
+}
+
+// CreateOrderRequest is used for creating a new order.
+type CreateOrderRequest struct {
+	UserID int `json:"user_id"`
+	Items  []struct {
+		ProductID int `json:"product_id"`
+		Quantity  int `json:"quantity"`
+	} `json:"items"`
+}
+
+// UpdateOrderStatusRequest is used for updating an order's status.
+type UpdateOrderStatusRequest struct {
+	Status OrderStatus `json:"status"`
+}
+// repository/product_repo.go
+package repository
+
+import (
+	"database/sql"
+	"fmt"
+	"my-go-app/models"
+	"time"
+)
+
+// ProductRepository handles database operations for Product models.
+type ProductRepository struct {
+	db *sql.DB
+}
+
+// NewProductRepository creates a new ProductRepository.
+func NewProductRepository(db *sql.DB) *ProductRepository {
+	return &ProductRepository{db: db}
+}
+
+// CreateProduct inserts a new product into the database.
+func (r *ProductRepository) CreateProduct(product *models.Product) error {
+	product.CreatedAt = time.Now()
+	product.UpdatedAt = time.Now()
+	res, err := r.db.Exec("INSERT INTO products(name, description, price, sku, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?)",
+		product.Name, product.Description, product.Price, product.SKU, product.CreatedAt, product.UpdatedAt)
+	if err != nil {
+		return fmt.Errorf("failed to create product: %w", err)
+	}
+	id, _ := res.LastInsertId()
+	product.ID = int(id) // Update the product struct with its new ID
+	return nil
+}
+
+// GetProductByID retrieves a product by its ID.
+func (r *ProductRepository) GetProductByID(id int) (*models.Product, error) {
+	product := &models.Product{}
+	err := r.db.QueryRow("SELECT id, name, description, price, sku, created_at, updated_at FROM products WHERE id = ?", id).
+		Scan(&product.ID, &product.Name, &product.Description, &product.Price, &product.SKU, &product.CreatedAt, &product.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil // Product not found
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get product by ID %d: %w", id, err)
+	}
+	return product, nil
+}
+
+// GetProductBySKU retrieves a product by its SKU.
+func (r *ProductRepository) GetProductBySKU(sku string) (*models.Product, error) {
+	product := &models.Product{}
+	err := r.db.QueryRow("SELECT id, name, description, price, sku, created_at, updated_at FROM products WHERE sku = ?", sku).
+		Scan(&product.ID, &product.Name, &product.Description, &product.Price, &product.SKU, &product.CreatedAt, &product.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil // Product not found
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get product by SKU %s: %w", sku, err)
+	}
+	return product, nil
+}
+
+// GetAllProducts retrieves all products from the database.
+func (r *ProductRepository) GetAllProducts() ([]models.Product, error) {
+	rows, err := r.db.Query("SELECT id, name, description, price, sku, created_at, updated_at FROM products")
+	if err != nil {
+		return nil, fmt.Errorf("failed to get all products: %w", err)
+	}
+	defer rows.Close()
+
+	var products []models.Product
+	for rows.Next() {
+		product := models.Product{}
+		if err := rows.Scan(&product.ID, &product.Name, &product.Description, &product.Price, &product.SKU, &product.CreatedAt, &product.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("failed to scan product row: %w", err)
+		}
+		products = append(products, product)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating product rows: %w", err)
+	}
+	return products, nil
+}
+
+// UpdateProduct updates an existing product in the database.
+func (r *ProductRepository) UpdateProduct(product *models.Product) error {
+	product.UpdatedAt = time.Now()
+	res, err := r.db.Exec("UPDATE products SET name = ?, description = ?, price = ?, sku = ?, updated_at = ? WHERE id = ?",
+		product.Name, product.Description, product.Price, product.SKU, product.UpdatedAt, product.ID)
+	if err != nil {
+		return fmt.Errorf("failed to update product: %w", err)
+	}
+	rowsAffected, _ := res.RowsAffected()
+	if rowsAffected == 0 {
+		return fmt.Errorf("product with ID %d not found for update", product.ID)
+	}
+	return nil
+}
+
+// DeleteProduct deletes a product from the database by its ID.
+func (r *ProductRepository) DeleteProduct(id int) error {
+	res, err := r.db.Exec("DELETE FROM products WHERE id = ?", id)
+	if err != nil {
+		return fmt.Errorf("failed to delete product: %w", err)
+	}
+	rowsAffected, _ := res.RowsAffected()
+	if rowsAffected == 0 {
+		return fmt.Errorf("product with ID %d not found for deletion", id)
+	}
+	return nil
+}
+
+
+
